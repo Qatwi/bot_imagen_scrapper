@@ -1,0 +1,1724 @@
+#!/usr/bin/env python3
+# bot_imagen.py
+"""
+Scraper thread-safe mejorado con:
+ - Cache SQLite con límite configurable o sin límite, expiración automática y comandos de gestión.
+ - Descargas paralelas con ThreadPoolExecutor para miles de imágenes con bajo uso de RAM.
+ - Registro completo de descargas (URL, nombre, MD5, fecha, categoría).
+ - Modo de reanudación para descargas interrumpidas usando un archivo de estado.
+ - Soporte para proxy Tor (socks5h://127.0.0.1:9050) opcional.
+ - Logging avanzado (INFO, WARNING, ERROR) y barra de progreso opcional con tqdm.
+ - Prevención de duplicados mediante URL y MD5.
+ - Cifrado AES-GCM para datos sensibles (opcional).
+ - Comandos CLI para limpiar, listar y revisar caché.
+ - Manejo robusto de errores y reintentos.
+ - Mejora en el reconocimiento automático de links y manejo de páginas inválidas.
+"""
+
+from __future__ import annotations
+import argparse
+import os
+import re
+import sys
+import time
+import hashlib
+import tempfile
+import sqlite3
+import logging
+import threading
+import json
+import signal
+import subprocess
+import queue
+import base64
+from typing import Optional, Tuple, List, Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from urllib.parse import urlparse, urljoin
+from requests.exceptions import RequestException, HTTPError
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+
+    def tqdm(*args, **kwargs):
+        class _DummyTqdm:
+            def update(self, n=1):
+                return None
+
+            def close(self):
+                return None
+
+        return _DummyTqdm()
+import requests
+from bs4 import BeautifulSoup
+try:
+    import cloudscraper
+    CLOUDSCRAPER_AVAILABLE = True
+except ImportError:
+    CLOUDSCRAPER_AVAILABLE = False
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    CRYPTO_AVAILABLE = True
+except ImportError:
+    CRYPTO_AVAILABLE = False
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox
+    from tkinter.scrolledtext import ScrolledText
+    TK_AVAILABLE = True
+except Exception:
+    TK_AVAILABLE = False
+
+# ---------- Configuración de Logging ----------
+def setup_logging(verbose: bool):
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%H:%M:%S'
+    )
+
+logger = logging.getLogger("scraper")
+
+# ---------- Constantes ----------
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CACHE_DB = os.path.join(SCRIPT_DIR, "scraper_cache.db")
+CACHE_TABLE = "images"
+CONFIG_FILE = os.path.join(SCRIPT_DIR, "scraper_config.json")
+STATE_FILE = os.path.join(SCRIPT_DIR, "scraper_state.json")
+MIN_SIZE_BYTES = 1024
+DEFAULT_WORKERS = 4
+DEFAULT_TOR_PROXY = "socks5h://127.0.0.1:9050"
+DEFAULT_CACHE_EXPIRY_DAYS = 30
+DEFAULT_CACHE_MAX_ENTRIES = 1000
+
+# ---------- Configuración de Sitios ----------
+# Sitios de búsqueda automática (orden de prioridad)
+# APIs específicas por categoría
+CATEGORY_APIS = {
+    'cat': {
+        'name': 'The Cat API',
+        'type': 'api',
+        'api_url': 'https://api.thecatapi.com/v1/images/search?limit=100',
+        'image_key': 'url',
+        'needs_cloudscraper': False
+    },
+    'dog': {
+        'name': 'Dog CEO API',
+        'type': 'api',
+        'api_url': 'https://dog.ceo/api/breeds/image/random/100',
+        'image_key': 'message',
+        'needs_cloudscraper': False
+    },
+    'fox': {
+        'name': 'RandomFox API',
+        'type': 'api',
+        'api_url': 'https://randomfox.ca/floof/',
+        'image_key': 'image',
+        'needs_cloudscraper': False,
+        'repeat': 50
+    }
+}
+
+# Palabras clave para detectar categoría
+CATEGORY_KEYWORDS = {
+    'cat': ['gato', 'gatos', 'cat', 'cats', 'kitten', 'gatito', 'felino', 'minino'],
+    'dog': ['perro', 'perros', 'dog', 'dogs', 'puppy', 'cachorro', 'canino'],
+    'fox': ['zorro', 'zorros', 'fox', 'foxes']
+}
+
+# Sitios genéricos (fallback)
+AUTO_SEARCH_SITES = [
+    {
+        'name': 'Wikimedia Commons',
+        'type': 'wikimedia',
+        'api_url': 'https://commons.wikimedia.org/w/api.php',
+        'needs_cloudscraper': False
+    }
+]
+
+SITE_CONFIGS = {
+    'auto': {
+        'type': 'auto',
+        'needs_cloudscraper': False
+    },
+    'generic': {
+        'type': 'generic',
+        'search_url': '{url}',
+        'image_selectors': [
+            'img[src$=".jpg"]', 'img[src$=".jpeg"]', 'img[src$=".png"]', 
+            'img[src$=".gif"]', 'img[src$=".webp"]', 'img[src$=".bmp"]',
+            'img[src*=".jpg"]', 'img[src*=".jpeg"]', 'img[src*=".png"]',
+            'img[src*=".gif"]', 'img[src*=".webp"]',
+            'meta[property="og:image"]', 'img[data-src]', 'img[data-lazy-src]',
+            'a[href$=".jpg"] img', 'a[href$=".png"] img', 'a[href$=".jpeg"] img',
+            'img'
+        ],
+        'full_image_attr': 'src',
+        'content_attr': 'content',
+        'needs_cloudscraper': False,
+        'pagination': '?page={page}'
+    }
+}
+
+# ---------- Almacenamiento local de hilos ----------
+_thread_local = threading.local()
+
+# ---------- Administrador de Configuración ----------
+class ConfigManager:
+    """Clase para manejar la configuración persistente en un archivo JSON."""
+    def __init__(self, config_path: str = CONFIG_FILE):
+        self.config_path = config_path
+        self._lock = threading.Lock()
+        self.config = self._load_config()
+
+    def _load_config(self) -> dict:
+        """Carga la configuración desde el archivo JSON."""
+        try:
+            with open(self.config_path, 'r') as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {'tag_dirs': {}, 'cache_max_entries': DEFAULT_CACHE_MAX_ENTRIES, 'cache_expiry_days': DEFAULT_CACHE_EXPIRY_DAYS}
+
+    def _save_config(self):
+        """Guarda la configuración en el archivo JSON."""
+        with self._lock:
+            try:
+                with open(self.config_path, 'w') as f:
+                    json.dump(self.config, f, indent=2)
+            except Exception as e:
+                logger.error(f"Falló al guardar configuración: {e}")
+
+    def get_tag_dir(self, tag: str) -> Optional[str]:
+        """Obtiene el directorio para un tag específico."""
+        return self.config.get('tag_dirs', {}).get(tag.lower())
+
+    def set_tag_dir(self, tag: str, output_dir: str):
+        """Establece el directorio para un tag específico."""
+        self.config.setdefault('tag_dirs', {})[tag.lower()] = output_dir
+        self._save_config()
+
+    def get_cache_max_entries(self) -> Optional[int]:
+        """Obtiene el máximo de entradas en caché (None si no hay límite)."""
+        return self.config.get('cache_max_entries')
+
+    def set_cache_max_entries(self, max_entries: Optional[int]):
+        """Establece el máximo de entradas en caché (None para sin límite)."""
+        self.config['cache_max_entries'] = max_entries
+        self._save_config()
+
+    def get_cache_expiry_days(self) -> int:
+        """Obtiene el número de días para expiración de caché."""
+        return self.config.get('cache_expiry_days', DEFAULT_CACHE_EXPIRY_DAYS)
+
+    def set_cache_expiry_days(self, expiry_days: int):
+        """Establece el número de días para expiración de caché."""
+        self.config['cache_expiry_days'] = expiry_days
+        self._save_config()
+
+# ---------- Administrador de Estado ----------
+class StateManager:
+    """Clase para manejar el estado de descarga para reanudación."""
+    def __init__(self, state_path: str = STATE_FILE):
+        self.state_path = state_path
+        self._lock = threading.Lock()
+        self.state = self._load_state()
+
+    def _load_state(self) -> dict:
+        """Carga el estado de descarga desde el archivo JSON."""
+        try:
+            with open(self.state_path, 'r') as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {'downloads': {}}
+
+    def _save_state(self):
+        """Guarda el estado de descarga en el archivo JSON."""
+        with self._lock:
+            try:
+                with open(self.state_path, 'w') as f:
+                    json.dump(self.state, f, indent=2)
+            except Exception as e:
+                logger.error(f"Falló al guardar estado: {e}")
+
+    def get_state(self, tag: str) -> dict:
+        """Obtiene el estado para un tag específico."""
+        return self.state.get('downloads', {}).get(tag.lower(), {'last_page': 0, 'last_post_id': None, 'downloaded_urls': []})
+
+    def update_state(self, tag: str, last_page: int, last_post_id: Optional[str], downloaded_urls: List[str]):
+        """Actualiza el estado para un tag específico."""
+        tag_state = self.state.setdefault('downloads', {}).setdefault(tag.lower(), {})
+        tag_state['last_page'] = last_page
+        tag_state['last_post_id'] = last_post_id
+        tag_state['downloaded_urls'] = downloaded_urls[-1000:]  # Limitar para optimizar memoria
+        self._save_state()
+
+# ---------- Administrador de Base de Datos ----------
+class DatabaseManager:
+    """Clase para manejar la base de datos SQLite con caché inteligente."""
+    def __init__(self, db_path: str = CACHE_DB, config: ConfigManager = None):
+        self.db_path = db_path
+        self.config = config
+        self._write_lock = threading.Lock()
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        cur = conn.cursor()
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {CACHE_TABLE} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url TEXT UNIQUE,
+                md5 TEXT,
+                etag TEXT,
+                size INTEGER,
+                filename TEXT,
+                tag TEXT,
+                last_seen INTEGER,
+                created_at INTEGER,
+                category TEXT
+            )
+        """)
+        
+        # Check if category column exists and add it if missing (migration)
+        try:
+            cur.execute(f"SELECT category FROM {CACHE_TABLE} LIMIT 1")
+        except sqlite3.OperationalError:
+            logger.info("Migrando base de datos: agregando columna 'category'")
+            cur.execute(f"ALTER TABLE {CACHE_TABLE} ADD COLUMN category TEXT DEFAULT 'general'")
+        
+        cur.execute(f'CREATE INDEX IF NOT EXISTS idx_md5 ON {CACHE_TABLE}(md5)')
+        cur.execute(f'CREATE INDEX IF NOT EXISTS idx_url ON {CACHE_TABLE}(url)')
+        cur.execute(f'CREATE INDEX IF NOT EXISTS idx_etag ON {CACHE_TABLE}(etag)')
+        cur.execute(f'CREATE INDEX IF NOT EXISTS idx_tag ON {CACHE_TABLE}(tag)')
+        conn.commit()
+        conn.close()
+        self._cleanup_cache()
+
+    def _cleanup_cache(self):
+        """Limpia la caché expirada o excedente según configuración."""
+        with self._write_lock:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            cur = conn.cursor()
+            # Expirar entradas antiguas
+            expiry_time = int(time.time()) - (self.config.get_cache_expiry_days() * 86400)
+            cur.execute(f"DELETE FROM {CACHE_TABLE} WHERE last_seen < ?", (expiry_time,))
+            deleted = cur.rowcount
+            if deleted > 0:
+                logger.info(f"Eliminadas {deleted} entradas expiradas (más antiguas de {self.config.get_cache_expiry_days()} días).")
+            # Limitar máximo de entradas (si está configurado)
+            max_entries = self.config.get_cache_max_entries()
+            if max_entries is not None:
+                cur.execute(f"SELECT COUNT(*) FROM {CACHE_TABLE}")
+                count = cur.fetchone()[0]
+                if count > max_entries:
+                    cur.execute(f"DELETE FROM {CACHE_TABLE} WHERE id NOT IN (SELECT id FROM {CACHE_TABLE} ORDER BY last_seen DESC LIMIT ?)", (max_entries,))
+                    deleted = cur.rowcount
+                    logger.info(f"Eliminadas {deleted} entradas antiguas para mantener máximo {max_entries} entradas.")
+            conn.commit()
+            conn.close()
+
+    def _get_conn(self) -> sqlite3.Connection:
+        """Obtiene una conexión a la base de datos."""
+        if getattr(_thread_local, "db_conn", None) is None:
+            _thread_local.db_conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            _thread_local.db_conn.row_factory = sqlite3.Row
+        return _thread_local.db_conn
+
+    def get_by_url(self, url: str):
+        """Obtiene una entrada de la caché por URL."""
+        conn = self._get_conn()
+        cur = conn.cursor()
+        cur.execute(f"SELECT * FROM {CACHE_TABLE} WHERE url=?", (url,))
+        return cur.fetchone()
+
+    def get_by_etag_or_size(self, etag: Optional[str], size: Optional[int]):
+        """Obtiene una entrada por ETag o tamaño."""
+        conn = self._get_conn()
+        cur = conn.cursor()
+        if etag:
+            cur.execute(f"SELECT * FROM {CACHE_TABLE} WHERE etag=?", (etag,))
+            row = cur.fetchone()
+            if row:
+                return row
+        if size is not None and isinstance(size, int) and size > 0:
+            cur.execute(f"SELECT * FROM {CACHE_TABLE} WHERE size=?", (size,))
+            return cur.fetchone()
+        return None
+
+    def get_by_md5(self, md5: str):
+        """Obtiene una entrada por MD5."""
+        conn = self._get_conn()
+        cur = conn.cursor()
+        cur.execute(f"SELECT * FROM {CACHE_TABLE} WHERE md5=?", (md5,))
+        return cur.fetchone()
+
+    def get_history_by_tag(self, tag: str) -> List[dict]:
+        """Obtiene el historial de imágenes descargadas para un tag."""
+        conn = self._get_conn()
+        cur = conn.cursor()
+        cur.execute(f"SELECT url, filename, size, md5, created_at, category FROM {CACHE_TABLE} WHERE tag=?", (tag.lower(),))
+        return [dict(row) for row in cur.fetchall()]
+
+    def list_cache(self) -> List[dict]:
+        """Lista todas las entradas en la caché."""
+        conn = self._get_conn()
+        cur = conn.cursor()
+        cur.execute(f"SELECT id, url, filename, size, md5, created_at, tag, category FROM {CACHE_TABLE}")
+        return [dict(row) for row in cur.fetchall()]
+
+    def insert_or_update(self, url: str, md5: str, etag: Optional[str], size: int, filename: str, tag: str, category: str):
+        """Inserta o actualiza una entrada en la caché."""
+        now = int(time.time())
+        with self._write_lock:
+            conn = self._get_conn()
+            cur = conn.cursor()
+            try:
+                cur.execute(f"""
+                    INSERT OR IGNORE INTO {CACHE_TABLE} (url, md5, etag, size, filename, tag, last_seen, created_at, category)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (url, md5, etag, size, filename, tag.lower(), now, now, category))
+                if cur.rowcount == 0:
+                    cur.execute(f"""
+                        UPDATE {CACHE_TABLE}
+                        SET md5=?, etag=?, size=?, filename=?, tag=?, last_seen=?, category=?
+                        WHERE url=?
+                    """, (md5, etag, size, filename, tag.lower(), now, category, url))
+                conn.commit()
+            except sqlite3.Error as e:
+                logger.error(f"Error de escritura en DB: {e}")
+
+    def clear_all(self):
+        """Limpia toda la caché."""
+        with self._write_lock:
+            conn = self._get_conn()
+            cur = conn.cursor()
+            cur.execute(f"DELETE FROM {CACHE_TABLE}")
+            conn.commit()
+            logger.info("Caché limpiada completamente")
+
+    def close(self):
+        """Cierra la conexión a la base de datos."""
+        conn = getattr(_thread_local, "db_conn", None)
+        if conn:
+            conn.close()
+            _thread_local.db_conn = None
+
+# ---------- Funciones de Cifrado (Opcional) ----------
+def encrypt_data(data: str, key: bytes) -> str:
+    """Cifra datos usando AES-GCM y devuelve el token cifrado en base64."""
+    if not CRYPTO_AVAILABLE:
+        logger.warning("Cifrado no disponible: instale cryptography")
+        return data
+    if len(key) != 32:
+        raise ValueError("La clave debe ser de 32 bytes (64 caracteres hex) para AES-GCM.")
+    aesgcm = AESGCM(key)
+    nonce = os.urandom(12)
+    ciphertext = aesgcm.encrypt(nonce, data.encode('utf-8'), None)
+    encrypted_data = nonce + ciphertext
+    return base64.b64encode(encrypted_data).decode('utf-8')
+
+def decrypt_data(encrypted_b64_data: str, key: bytes) -> Optional[str]:
+    """Descifra datos cifrados en base64 usando AES-GCM."""
+    if not CRYPTO_AVAILABLE:
+        logger.warning("Descifrado no disponible: instale cryptography")
+        return encrypted_b64_data
+    try:
+        encrypted_data = base64.b64decode(encrypted_b64_data)
+        nonce = encrypted_data[:12]
+        ciphertext = encrypted_data[12:]
+        aesgcm = AESGCM(key)
+        decrypted_bytes = aesgcm.decrypt(nonce, ciphertext, None)
+        return decrypted_bytes.decode('utf-8')
+    except Exception as e:
+        logger.error(f"Error al descifrar datos: {e}")
+        return None
+
+# ---------- Utilidades ----------
+def compute_md5(path: str) -> str:
+    """Calcula el hash MD5 de un archivo."""
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def normalize_url(url: str) -> str:
+    """Normaliza una URL eliminando parámetros y asegurando el formato."""
+    if not url:
+        return ""
+    url = re.sub(r'\?.*$', '', url)
+    url = re.sub(r'//+', '//', url)
+    if not url.startswith("http"):
+        url = "https://" + url.lstrip('/')
+    return url.strip()
+
+def get_ext_from_content_type(content_type: Optional[str]) -> str:
+    """Obtiene la extensión de archivo según el tipo de contenido."""
+    if not content_type:
+        return '.jpg'
+    mime = content_type.split(';')[0].strip().lower()
+    if 'image/' in mime:
+        ext = '.' + mime.split('/')[1]
+        return '.jpg' if ext == '.jpeg' else ext
+    return '.jpg'
+
+def get_session(use_cloudscraper: bool, proxy: Optional[str]):
+    """Crea una sesión HTTP con soporte para cloudscraper y proxy."""
+    if getattr(_thread_local, "http_session", None) is None:
+        if use_cloudscraper and CLOUDSCRAPER_AVAILABLE:
+            s = cloudscraper.create_scraper(
+                browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False},
+                delay=10
+            )
+        else:
+            s = requests.Session()
+        s.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9,es;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0'
+        })
+        if proxy:
+            s.proxies.update({'http': proxy, 'https': proxy})
+            logger.info(f"Proxy/Tor habilitado: {proxy}")
+        _thread_local.http_session = s
+    return _thread_local.http_session
+
+# ---------- Scraper ----------
+class AutoImageScraper:
+    """Scraper automático que busca en múltiples sitios con solo el término de búsqueda."""
+    
+    def __init__(self, query: str, max_images: int, use_cloudscraper: bool = False, proxy: Optional[str] = None, max_retries: int = 3):
+        self.query = query.replace(' ', '+')
+        self.query_tag = query.replace(' ', '_').lower()
+        self.run_nonce = str(int(time.time() * 1000))
+        self.max_images = max_images
+        self.use_cloudscraper = use_cloudscraper
+        self.proxy = proxy
+        self.max_retries = max_retries
+        self.collected_urls = []
+        self.seen_urls = set()
+        logger.info(f"🔍 Modo AUTO: Buscando '{query}' en múltiples sitios...")
+    
+    def _extract_images_from_generated(self, site_config: dict) -> List[str]:
+        """Genera URLs de imagen basadas en un patrón (sin necesidad de JSON)."""
+        images = []
+        url_pattern = site_config.get('url_pattern', '')
+        if not url_pattern:
+            return images
+        
+        logger.info(f"  → Generando URLs de {site_config['name']}...")
+        for i in range(self.max_images + 10):
+            seed = f"{self.query_tag}-{self.run_nonce}-{i}"
+            url = url_pattern.format(seed=seed)
+            if url not in self.seen_urls:
+                images.append(url)
+                self.seen_urls.add(url)
+        
+        logger.info(f"    ✓ {len(images)} URLs generadas de {site_config['name']}")
+        return images
+    
+    def _extract_images_from_wikimedia(self, site_config: dict) -> List[str]:
+        """Extrae imágenes de Wikimedia Commons."""
+        images: List[str] = []
+        api_url = site_config.get('api_url') or 'https://commons.wikimedia.org/w/api.php'
+        logger.info(f"  → Consultando API: {site_config['name']}...")
+        
+        try:
+            session = get_session(False, self.proxy)
+            headers = {
+                'Accept': 'application/json',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+
+            bad_terms = [
+                'chart', 'graph', 'diagram', 'infographic', 'map', 'logo', 'icon', 'flag', 'seal',
+                'mortality', 'rate', 'statistics', 'statistic', 'data', 'plot'
+            ]
+
+            raw_query = self.query.replace('+', ' ').strip().lower()
+            tokens = [t for t in re.split(r"[^a-z0-9]+", raw_query) if t]
+            stop = {
+                'a', 'an', 'the', 'of', 'and', 'or', 'to', 'in', 'on', 'for', 'with',
+                'de', 'del', 'la', 'el', 'los', 'las', 'un', 'una'
+            }
+            tokens = [t for t in tokens if t not in stop and len(t) >= 2]
+
+            category = self._detect_category()
+            if category in {'cat', 'dog', 'fox'} and category not in tokens:
+                tokens.append(category)
+
+            def _title_ok(title: str) -> bool:
+                if not tokens:
+                    return True
+                t = title.lower().replace('file:', '')
+                title_tokens = {x for x in re.split(r"[^a-z0-9]+", t) if x}
+                return all(tok in title_tokens for tok in tokens)
+
+            min_bytes = 40 * 1024
+            min_dim = 300
+
+            candidates: List[tuple[int, str]] = []
+
+            offset = 0
+            page_size = 50
+            max_pages = 6
+            while offset < page_size * max_pages and len(candidates) < self.max_images:
+                params = {
+                    'action': 'query',
+                    'format': 'json',
+                    'generator': 'search',
+                    'gsrsearch': raw_query,
+                    'gsrnamespace': 6,
+                    'gsrlimit': page_size,
+                    'gsroffset': offset,
+                    'prop': 'imageinfo',
+                    'iiprop': 'url|mime|size|dimensions'
+                }
+                resp = session.get(api_url, params=params, headers=headers, timeout=30)
+                resp.raise_for_status()
+                data = resp.json()
+                pages = (data.get('query') or {}).get('pages') or {}
+                if not pages:
+                    break
+
+                for page in pages.values():
+                    title_raw = page.get('title') or ''
+                    if not title_raw:
+                        continue
+                    title = title_raw.lower().replace('file:', '')
+                    if any(t in title for t in bad_terms):
+                        continue
+                    if not _title_ok(title_raw):
+                        continue
+
+                    infos = page.get('imageinfo') or []
+                    if not infos:
+                        continue
+                    info0 = infos[0] if isinstance(infos[0], dict) else {}
+                    url = info0.get('url')
+                    if not url:
+                        continue
+
+                    size_bytes = info0.get('size')
+                    if isinstance(size_bytes, int) and size_bytes < min_bytes:
+                        continue
+                    w = info0.get('width')
+                    h = info0.get('height')
+                    if isinstance(w, int) and isinstance(h, int) and (w < min_dim or h < min_dim):
+                        continue
+
+                    low = url.lower()
+                    if low.endswith('.svg') or low.endswith('.tif') or low.endswith('.tiff'):
+                        continue
+                    if low.endswith('.gif'):
+                        continue
+                    if any(t in low for t in bad_terms):
+                        continue
+                    if not re.search(r'\.(jpe?g|png|webp)(\?.*)?$', low, re.IGNORECASE):
+                        continue
+
+                    mime = (info0.get('mime') or '').lower()
+                    score = 0
+                    if low.endswith('.jpg') or low.endswith('.jpeg') or mime == 'image/jpeg':
+                        score += 20
+                    elif low.endswith('.webp') or mime == 'image/webp':
+                        score += 15
+                    elif low.endswith('.png') or mime == 'image/png':
+                        score += 5
+
+                    title_tokens = {x for x in re.split(r"[^a-z0-9]+", title) if x}
+                    for tok in tokens:
+                        if tok in title_tokens:
+                            score += 10
+
+                    if isinstance(size_bytes, int):
+                        if size_bytes >= 2 * 1024 * 1024:
+                            score += 5
+                        elif size_bytes >= 700 * 1024:
+                            score += 2
+
+                    if url not in self.seen_urls:
+                        candidates.append((score, url))
+                        self.seen_urls.add(url)
+
+                offset += page_size
+        except Exception as e:
+            logger.debug(f"    ✗ Error en API {site_config['name']}: {e}")
+            return []
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        images = [u for _, u in candidates]
+        logger.info(f"    ✓ {len(images)} imágenes de {site_config['name']}")
+        return images
+    
+    def _extract_images_from_api(self, site_config: dict) -> List[str]:
+        """Extrae imágenes de una API JSON."""
+        images = []
+        api_url = site_config.get('api_url', '')
+        if not api_url:
+            return images
+        # Formatear URL si tiene placeholders
+        if '{page}' in api_url:
+            api_url = api_url.format(page=1)
+        image_key = site_config['image_key']
+        logger.info(f"  → Consultando API: {site_config['name']}...")
+        
+        session = get_session(False, self.proxy)
+        headers = {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+
+        data = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                # Soporte para POST
+                if site_config.get('method') == 'POST':
+                    body = site_config.get('body', {})
+                    resp = session.post(api_url, json=body, timeout=30, headers=headers)
+                else:
+                    resp = session.get(api_url, timeout=30, headers=headers)
+
+                resp.raise_for_status()
+
+                content_type = (resp.headers.get('Content-Type') or '').lower()
+                text_preview = (resp.text or '').strip()[:200]
+                if 'application/json' not in content_type:
+                    if not text_preview or text_preview.startswith('<'):
+                        raise ValueError(f"Respuesta no-JSON (Content-Type: {content_type})")
+
+                try:
+                    data = resp.json()
+                except Exception as e:
+                    raise ValueError(f"JSON inválido: {e}")
+
+                break
+            except Exception as e:
+                if attempt >= self.max_retries:
+                    logger.debug(f"    ✗ JSON inválido en {site_config['name']}: {e}")
+                    return images
+                time.sleep(0.5 * (2 ** attempt))
+
+        if data is None:
+            return images
+
+        # Manejar diferentes estructuras de respuesta
+        image_subkey = site_config.get('image_subkey')
+
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict) and image_key in item:
+                    img_url = item[image_key]
+                    if img_url and img_url not in self.seen_urls:
+                        images.append(img_url)
+                        self.seen_urls.add(img_url)
+                elif isinstance(item, str):
+                    if item not in self.seen_urls:
+                        images.append(item)
+                        self.seen_urls.add(item)
+        elif isinstance(data, dict):
+            img_list = data.get(image_key, [])
+            if isinstance(img_list, list):
+                for item in img_list:
+                    # Si hay subkey, extraer URL del objeto anidado
+                    if image_subkey and isinstance(item, dict):
+                        # Soportar claves anidadas como "src.original"
+                        img_url = item
+                        for key in image_subkey.split('.'):
+                            if isinstance(img_url, dict):
+                                img_url = img_url.get(key)
+                            else:
+                                img_url = None
+                                break
+                    else:
+                        img_url = item
+                    if img_url and img_url not in self.seen_urls:
+                        images.append(img_url)
+                        self.seen_urls.add(img_url)
+            
+        logger.info(f"    ✓ {len(images)} imágenes de {site_config['name']}")
+        
+        return images
+    
+    def _detect_category(self) -> Optional[str]:
+        """Detecta la categoría de búsqueda basándose en palabras clave."""
+        query_lower = self.query.lower().replace('+', ' ')
+        for category, keywords in CATEGORY_KEYWORDS.items():
+            for keyword in keywords:
+                if keyword in query_lower:
+                    return category
+        return None
+    
+    def fetch_image_urls(self) -> List[Tuple[str, Optional[str]]]:
+        """Busca imágenes en todos los sitios configurados."""
+        logger.info(f"🚀 Iniciando búsqueda automática para: '{self.query}'")
+        
+        # Detectar categoría específica
+        category = self._detect_category()
+        if category and category in CATEGORY_APIS:
+            api_config = CATEGORY_APIS[category]
+            logger.info(f"🎯 Categoría detectada: {category} → usando {api_config['name']}")
+            images = self._extract_images_from_api(api_config)
+            for img_url in images:
+                if len(self.collected_urls) >= self.max_images:
+                    break
+                self.collected_urls.append((img_url, None))
+        
+        # Si no hay suficientes, usar sitios genéricos
+        for site in AUTO_SEARCH_SITES:
+            if len(self.collected_urls) >= self.max_images:
+                break
+            
+            site_type = site.get('type', '')
+            if site_type == 'api':
+                images = self._extract_images_from_api(site)
+            elif site_type == 'wikimedia':
+                images = self._extract_images_from_wikimedia(site)
+            elif site_type == 'generated':
+                images = self._extract_images_from_generated(site)
+            else:
+                images = self._extract_images_from_site(site)
+            
+            for img_url in images:
+                if len(self.collected_urls) >= self.max_images:
+                    break
+                self.collected_urls.append((img_url, None))
+            
+            time.sleep(0.5)
+        
+        logger.info(f"📊 Total: {len(self.collected_urls)} imágenes encontradas")
+        return self.collected_urls[:self.max_images]
+
+
+class GenericImageScraper:
+    """Clase para scrapear imágenes de cualquier sitio web."""
+    def __init__(self, domain: str, tag: str, max_images: int, use_cloudscraper: bool, proxy: Optional[str], max_retries: int = 5, state_manager: StateManager = None, direct_url: str = None):
+        self.original_domain = domain
+        self.domain = domain.lower().replace('https://', '').replace('http://', '').rstrip('/')
+        self.tag = tag.replace('#', '').replace(' ', '_') if tag else ''
+        self.max_images = max_images
+        self.proxy = proxy
+        self.max_retries = max_retries
+        self.state_manager = state_manager
+        self.direct_url = direct_url
+        
+        # Detectar si es una URL directa o un dominio conocido
+        if self.direct_url or self._is_url(domain):
+            self.config = SITE_CONFIGS['generic']
+            self.is_direct_url = True
+            self.direct_url = direct_url or domain
+            logger.info(f"Modo URL directa: {self.direct_url}")
+        elif self.domain in SITE_CONFIGS:
+            self.config = SITE_CONFIGS[self.domain]
+            self.is_direct_url = False
+            logger.info(f"Usando configuración predefinida para: {self.domain}")
+        else:
+            self.config = SITE_CONFIGS['generic']
+            self.is_direct_url = False
+            logger.info(f"Dominio no reconocido, usando scraper genérico para: {self.domain}")
+        
+        self.use_cloudscraper = use_cloudscraper or self.config.get('needs_cloudscraper', False)
+    
+    def _is_url(self, text: str) -> bool:
+        """Verifica si el texto es una URL."""
+        return text.startswith('http://') or text.startswith('https://') or '/' in text
+
+    def extract_images_from_page(self, page_url: str) -> List[Tuple[str, Optional[str]]]:
+        """Extrae todas las URLs de imágenes de una página."""
+        images = []
+        seen_urls = set()
+        
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                session = get_session(self.use_cloudscraper, self.proxy)
+                resp = session.get(page_url, timeout=60)
+                resp.raise_for_status()
+                soup = BeautifulSoup(resp.text, 'html.parser')
+                
+                for selector in self.config['image_selectors']:
+                    if 'meta' in selector:
+                        elements = soup.select(selector)
+                        for elem in elements:
+                            img_url = elem.get(self.config.get('content_attr', 'content'))
+                            if img_url and img_url not in seen_urls:
+                                img_url = self._process_image_url(img_url, page_url)
+                                if img_url:
+                                    images.append((img_url, None))
+                                    seen_urls.add(img_url)
+                    else:
+                        elements = soup.select(selector)
+                        for elem in elements:
+                            img_url = elem.get(self.config.get('full_image_attr', 'src'))
+                            if not img_url:
+                                img_url = elem.get('data-src') or elem.get('data-lazy-src') or elem.get('srcset', '').split()[0] if elem.get('srcset') else None
+                            if img_url and img_url not in seen_urls:
+                                img_url = self._process_image_url(img_url, page_url)
+                                if img_url:
+                                    images.append((img_url, None))
+                                    seen_urls.add(img_url)
+                
+                # También buscar enlaces directos a imágenes
+                for a_tag in soup.find_all('a', href=True):
+                    href = a_tag['href']
+                    if re.search(r'\.(jpe?g|png|gif|webp|bmp)(\?.*)?$', href, re.IGNORECASE):
+                        full_url = urljoin(page_url, href)
+                        if full_url not in seen_urls:
+                            images.append((full_url, None))
+                            seen_urls.add(full_url)
+                
+                logger.info(f"Encontradas {len(images)} imágenes en {page_url}")
+                return images
+                
+            except RequestException as e:
+                logger.warning(f"Intento {attempt}/{self.max_retries} falló para {page_url}: {e}")
+                if attempt < self.max_retries:
+                    time.sleep(2 ** attempt)
+                else:
+                    logger.error(f"Falló al extraer imágenes de {page_url} después de {self.max_retries} intentos")
+                    return []
+        return []
+    
+    def _process_image_url(self, img_url: str, base_url: str) -> Optional[str]:
+        """Procesa y valida una URL de imagen."""
+        if not img_url:
+            return None
+        
+        # Ignorar data URIs y placeholders
+        if img_url.startswith('data:') or 'placeholder' in img_url.lower() or 'blank' in img_url.lower():
+            return None
+        
+        # Ignorar imágenes muy pequeñas (iconos, etc.)
+        if any(x in img_url.lower() for x in ['icon', 'logo', 'avatar', 'thumb', '1x1', 'pixel']):
+            return None
+        
+        # Ignorar videos
+        if re.search(r'\.(mp4|webm|avi|mov|flv)(\?.*)?$', img_url, re.IGNORECASE):
+            return None
+        
+        # Construir URL completa
+        full_url = urljoin(base_url, img_url)
+        
+        # Verificar que sea una imagen válida
+        if re.search(r'\.(jpe?g|png|gif|webp|bmp|svg)(\?.*)?$', full_url, re.IGNORECASE):
+            return normalize_url(full_url)
+        
+        # Si no tiene extensión clara pero parece imagen, incluirla
+        if 'image' in img_url.lower() or any(x in img_url for x in ['/img/', '/images/', '/photo/', '/pics/']):
+            return normalize_url(full_url)
+        
+        return None
+
+    def extract_image_from_post(self, post_url: str) -> Optional[Tuple[str, str]]:
+        """Extrae la URL de la imagen y el ID del post (para compatibilidad booru)."""
+        images = self.extract_images_from_page(post_url)
+        if images:
+            match = re.search(r'id=(\d+)', post_url)
+            post_id = match.group(1) if match else None
+            return images[0][0], post_id
+        return None, None
+
+    def scrape_page(self, page_num: int = 0) -> List[Tuple[str, Optional[str]]]:
+        """Scrapea una página de resultados."""
+        urls = []
+        
+        # Construir URL de búsqueda
+        if self.is_direct_url:
+            search_url = self.direct_url
+            if page_num > 0 and 'pagination' in self.config:
+                sep = '&' if '?' in search_url else '?'
+                search_url += sep + self.config['pagination'].format(page=page_num).lstrip('?&')
+        else:
+            if self.config['type'] == 'booru':
+                search_url = self.config['search_url'].format(tag=self.tag)
+                if 'pagination' in self.config and page_num > 0:
+                    search_url += self.config['pagination'].format(page=page_num * 42)
+            else:
+                search_url = self.config['search_url'].format(tag=self.tag, url=self.original_domain)
+                if 'pagination' in self.config and page_num > 0:
+                    sep = '&' if '?' in search_url else '?'
+                    search_url += sep + self.config['pagination'].format(page=page_num).lstrip('?&')
+        
+        logger.info(f"Scrapeando página {page_num + 1}: {search_url}")
+        
+        # Para sitios tipo booru, procesar posts individuales
+        if self.config.get('type') == 'booru' and 'post_selector' in self.config:
+            for attempt in range(1, self.max_retries + 1):
+                try:
+                    session = get_session(self.use_cloudscraper, self.proxy)
+                    resp = session.get(search_url, timeout=60)
+                    resp.raise_for_status()
+                    soup = BeautifulSoup(resp.text, 'html.parser')
+                    post_links = soup.select(self.config['post_selector'])
+                    logger.info(f"Encontrados {len(post_links)} posts en página {page_num + 1}")
+                    for i, link in enumerate(post_links, 1):
+                        post_url = urljoin(search_url, link.get('href'))
+                        logger.debug(f"Procesando post {i}/{len(post_links)}: {post_url}")
+                        img_url, post_id = self.extract_image_from_post(post_url)
+                        if img_url:
+                            urls.append((normalize_url(img_url), post_id))
+                        time.sleep(0.5)
+                    return urls
+                except RequestException as e:
+                    logger.warning(f"Intento {attempt}/{self.max_retries} falló para página {page_num + 1}: {e}")
+                    if attempt < self.max_retries:
+                        time.sleep(2 ** attempt)
+                    else:
+                        logger.error(f"Falló al scrapear página {page_num + 1} después de {self.max_retries} intentos")
+                        return []
+        else:
+            # Para sitios genéricos, extraer imágenes directamente de la página
+            return self.extract_images_from_page(search_url)
+
+    def fetch_image_urls(self) -> List[Tuple[str, Optional[str]]]:
+        """Obtiene URLs de imágenes, reanudando desde el estado guardado si existe."""
+        all_urls = []
+        seen_urls = set()
+        state = self.state_manager.get_state(self.tag) if self.state_manager else {'last_page': 0, 'last_post_id': None, 'downloaded_urls': []}
+        start_page = state.get('last_page', 0)
+        downloaded_urls = set(state.get('downloaded_urls', []))
+        page = max(0, start_page)  # Asegurar que la página no sea negativa
+        while len(all_urls) < self.max_images:
+            urls = self.scrape_page(page)
+            if not urls:
+                logger.info("No se encontraron más posts")
+                break
+            for url, post_id in urls:
+                if url not in seen_urls and url not in downloaded_urls:
+                    all_urls.append((url, post_id))
+                    seen_urls.add(url)
+            page += 1
+            if len(all_urls) >= self.max_images:
+                break
+            time.sleep(2)
+        logger.info(f"Encontradas {len(all_urls)} imágenes únicas")
+        if self.state_manager:
+            self.state_manager.update_state(self.tag, page - 1, all_urls[-1][1] if all_urls else None, list(seen_urls))
+        return all_urls[:self.max_images]
+
+# ---------- Downloader ----------
+class ImageDownloader:
+    """Clase para descargar imágenes con manejo de caché y barra de progreso."""
+    def __init__(self, db: DatabaseManager, output_dir: str, tag: str, category: str, use_cloudscraper: bool = False,
+                 proxy: Optional[str] = None, max_retries: int = 5, force_download: bool = False, progress: bool = False, key: Optional[bytes] = None):
+        self.db = db
+        self.tag = tag.replace(' ', '_').lower()
+        self.category = category
+        self.use_cloudscraper = use_cloudscraper
+        self.proxy = proxy
+        self.max_retries = max_retries
+        self.force_download = force_download
+        self.key = key
+        self.output_dir = output_dir
+        self.progress = progress
+        try:
+            os.makedirs(self.output_dir, exist_ok=True, mode=0o755)
+            try:
+                os.chmod(self.output_dir, 0o755)
+            except Exception:
+                pass
+            if not os.access(self.output_dir, os.W_OK):
+                try:
+                    st = os.stat(self.output_dir)
+                    mode = oct(st.st_mode & 0o777)
+                    logger.error(f"Sin permisos de escritura para el directorio: {self.output_dir} (uid={st.st_uid}, gid={st.st_gid}, mode={mode})")
+                except Exception:
+                    logger.error(f"Sin permisos de escritura para el directorio: {self.output_dir}")
+                sys.exit(1)
+        except Exception as e:
+            logger.error(f"Falló al crear/acceder al directorio de salida {self.output_dir}: {e}")
+            sys.exit(1)
+
+    def _head_info(self, session, url: str) -> dict:
+        """Obtiene información de cabecera de una URL."""
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                resp = session.head(url, allow_redirects=True, timeout=120)
+                return {'status_code': resp.status_code, 'headers': resp.headers}
+            except RequestException:
+                try:
+                    resp = session.get(url, stream=True, timeout=120)
+                    return {'status_code': resp.status_code, 'headers': resp.headers}
+                except RequestException as e:
+                    logger.debug(f"Intento {attempt}/{self.max_retries} falló al obtener cabeceras para {url}: {e}")
+                    if attempt < self.max_retries:
+                        time.sleep(2 ** attempt)
+                    else:
+                        return {'status_code': None, 'headers': {}}
+
+    def download_one(self, url: str, post_id: Optional[str], idx: int, total: int, pbar: Optional[tqdm] = None) -> bool:
+        """Descarga una imagen individual con manejo de caché y reintentos."""
+        url_norm = normalize_url(url)
+        if not url_norm:
+            logger.warning(f"[{idx:02d}/{total:02d}] URL inválida: {url}")
+            if pbar:
+                pbar.update(1)
+            return False
+
+        # Cifrar URL para caché si se proporciona clave
+        url_to_store = encrypt_data(url_norm, self.key) if self.key and CRYPTO_AVAILABLE else url_norm
+
+        if not self.force_download:
+            row = self.db.get_by_url(url_to_store)
+            if row:
+                logger.info(f"[{idx:02d}/{total:02d}] ⚠️ Ya en caché (id={row['id']}): {url_norm}")
+                if pbar:
+                    pbar.update(1)
+                return False
+
+        session = get_session(self.use_cloudscraper, self.proxy)
+        
+        # Sitios que no soportan HEAD o redirigen - descargar directamente
+        skip_head_check = any(x in url_norm for x in ['imgur.com', 'picsum.photos', 'thecatapi.com', 'dog.ceo'])
+        etag = None
+        size = None
+        
+        if not skip_head_check:
+            head = self._head_info(session, url)
+            headers = head.get('headers', {})
+            status = head.get('status_code')
+
+            etag = headers.get('ETag') or headers.get('Etag')
+            size = headers.get('Content-Length')
+            size = int(size) if size and size.isdigit() else None
+            content_type = headers.get('Content-Type', '')
+
+            if status is not None and status >= 400:
+                logger.warning(f"[{idx:02d}/{total:02d}] HEAD indica HTTP {status} para {url_norm}")
+                if pbar:
+                    pbar.update(1)
+                return False
+
+            # Solo verificar duplicados si el Content-Type indica que es una imagen
+            is_image = 'image/' in content_type.lower()
+            if not self.force_download and is_image and (etag or size):
+                existing = self.db.get_by_etag_or_size(etag, size)
+                if existing:
+                    logger.info(f"[{idx:02d}/{total:02d}] ⚠️ Duplicado por ETag/tamaño (id={existing['id']}): {url_norm}")
+                    self.db.insert_or_update(url_to_store, existing['md5'] or '', existing['etag'], existing['size'] or 0, existing['filename'] or '', self.tag, self.category)
+                    if pbar:
+                        pbar.update(1)
+                    return False
+
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                s_headers = {'Referer': f"{urlparse(url).scheme}://{urlparse(url).netloc}"}
+                resp = session.get(url, headers=s_headers, stream=True, timeout=120)
+                resp.raise_for_status()
+                
+                # Verificar que sea realmente una imagen
+                content_type = resp.headers.get('Content-Type', '').lower()
+                if 'image/' not in content_type:
+                    logger.warning(f"[{idx:02d}/{total:02d}] No es imagen (Content-Type: {content_type}): {url_norm}")
+                    if pbar:
+                        pbar.update(1)
+                    return False
+                
+                ext = get_ext_from_content_type(resp.headers.get('Content-Type'))
+                with tempfile.NamedTemporaryFile(delete=False, suffix=ext, dir=self.output_dir) as tf:
+                    tmp_path = tf.name
+                    for chunk in resp.iter_content(chunk_size=8192):  # Optimización de RAM con streaming
+                        if chunk:
+                            tf.write(chunk)
+                file_size = os.path.getsize(tmp_path)
+                if file_size < MIN_SIZE_BYTES:
+                    logger.warning(f"[{idx:02d}/{total:02d}] Descarga demasiado pequeña ({file_size} bytes), saltando: {url_norm}")
+                    os.unlink(tmp_path)
+                    if pbar:
+                        pbar.update(1)
+                    return False
+
+                md5 = compute_md5(tmp_path)
+                if not self.force_download:
+                    md5row = self.db.get_by_md5(md5)
+                    if md5row:
+                        logger.info(f"[{idx:02d}/{total:02d}] ⚠️ Duplicado por MD5 (id={md5row['id']}): {url_norm}")
+                        os.unlink(tmp_path)
+                        self.db.insert_or_update(url_to_store, md5, etag, file_size, md5row['filename'] or '', self.tag, self.category)
+                        if pbar:
+                            pbar.update(1)
+                        return False
+
+                pref = f"{self.tag}_id_{post_id}" if post_id else f"{self.tag}_id_{hashlib.md5(url_norm.encode()).hexdigest()}"
+                final_name = f"{pref}_image{ext}"
+                final_path = os.path.join(self.output_dir, final_name)
+                counter = 1
+                while os.path.exists(final_path):
+                    final_name = f"{pref}_image_{counter}{ext}"
+                    final_path = os.path.join(self.output_dir, final_name)
+                    counter += 1
+
+                os.replace(tmp_path, final_path)
+                try:
+                    os.chmod(final_path, 0o644)
+                except Exception:
+                    pass
+                self.db.insert_or_update(url_to_store, md5, etag, file_size, os.path.basename(final_path), self.tag, self.category)
+                logger.info(f"[{idx:02d}/{total:02d}] ✅ Guardada: {os.path.basename(final_path)} ({file_size // 1024} KB)")
+                if pbar:
+                    pbar.update(1)
+                return True
+
+            except HTTPError as e:
+                code = getattr(e.response, "status_code", None)
+                logger.warning(f"[{idx:02d}/{total:02d}] Error HTTP (intento {attempt}/{self.max_retries}) {code} para {url_norm}")
+                if attempt >= self.max_retries:
+                    logger.error(f"[{idx:02d}/{total:02d}] ❌ Falló HTTP: {url_norm}")
+                    if pbar:
+                        pbar.update(1)
+                    return False
+            except RequestException as e:
+                logger.warning(f"[{idx:02d}/{total:02d}] Falló solicitud (intento {attempt}/{self.max_retries}): {e}")
+                if attempt < self.max_retries:
+                    time.sleep(2 ** attempt)
+                    continue
+                logger.error(f"[{idx:02d}/{total:02d}] ❌ Falló después de reintentos: {url_norm}")
+                if pbar:
+                    pbar.update(1)
+                    return False
+            except Exception as e:
+                logger.exception(f"[{idx:02d}/{total:02d}] Error inesperado descargando {url_norm}: {e}")
+                try:
+                    if 'tmp_path' in locals() and os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+                except Exception:
+                    pass
+                if pbar:
+                    pbar.update(1)
+                return False
+
+        if pbar:
+            pbar.update(1)
+        return False
+
+# ---------- Manejo de Señales ----------
+def handle_signal(sig, frame, state_manager: StateManager, tag: str, page: int, downloaded_urls: List[str]):
+    """Maneja señales de interrupción (Ctrl+C) guardando el estado."""
+    logger.info("Interrupción recibida (Ctrl+C). Guardando estado y finalizando...")
+    if state_manager:
+        state_manager.update_state(tag, page, None, downloaded_urls)
+    sys.exit(0)
+
+# ---------- CLI ----------
+def parse_args():
+    """Define los argumentos de la línea de comandos."""
+    p = argparse.ArgumentParser(description="Bot de Imágenes - Scraper automático universal.")
+    p.add_argument("--cli", action="store_true", help="Ejecutar en modo consola")
+    p.add_argument("-s", "--search", required=False, help="Búsqueda automática (ej: 'gatos', 'paisajes')")
+    p.add_argument("-d", "--domain", required=False, help="URL o dominio específico (opcional)")
+    p.add_argument("-t", "--tag", required=False, help="Tag adicional (opcional)")
+    p.add_argument("-n", "--number", type=int, default=10, help="Número de imágenes a descargar")
+    p.add_argument("-o", "--output", default="images", help="Directorio de salida")
+    p.add_argument("-w", "--workers", type=int, default=DEFAULT_WORKERS, help="Número de hilos paralelos")
+    p.add_argument("--proxy", help="URL del proxy (ej. socks5h://127.0.0.1:9050)")
+    p.add_argument("--no-proxy", action="store_true", help="Deshabilitar proxy")
+    p.add_argument("--cloudscraper", action="store_true", help="Usar cloudscraper para eludir Cloudflare")
+    p.add_argument("--force", action="store_true", help="Forzar descarga, ignorando caché")
+    p.add_argument("--clear-cache", action="store_true", help="Limpiar caché antes de iniciar")
+    p.add_argument("--history", action="store_true", help="Mostrar historial de imágenes para el tag")
+    p.add_argument("--list-cache", action="store_true", help="Listar todas las entradas en caché")
+    p.add_argument("--override-dir", action="store_true", help="Agregar tag como subdirectorio a -o")
+    p.add_argument("--verbose", action="store_true", help="Logging detallado")
+    p.add_argument("--progress", action="store_true", help="Mostrar barra de progreso")
+    p.add_argument("--cache-max", type=int, default=None, help="Máximo de entradas en caché (0 para sin límite)")
+    p.add_argument("--cache-expiry", type=int, default=DEFAULT_CACHE_EXPIRY_DAYS, help="Días para expiración de caché")
+    p.add_argument("--category", default="general", help="Categoría para las imágenes")
+    p.add_argument("--key", help="Clave de cifrado (hexadecimal, 64 caracteres) para AES-GCM")
+    return p.parse_args()
+
+
+def run_cli(args):
+    setup_logging(args.verbose)
+    logger.info("Iniciando scraper")
+    logger.debug(f"Argumentos de línea de comandos: {vars(args)}")
+
+    if args.cloudscraper and not CLOUDSCRAPER_AVAILABLE:
+        logger.error("cloudscraper no disponible; instale con: pip install cloudscraper")
+        sys.exit(1)
+    if args.key and not CRYPTO_AVAILABLE:
+        logger.error("Cifrado no disponible; instale con: pip install cryptography")
+        sys.exit(1)
+    if args.progress and not TQDM_AVAILABLE:
+        logger.warning("tqdm no disponible; desactivando --progress")
+        args.progress = False
+
+    # Validar clave de cifrado
+    key = None
+    if args.key:
+        try:
+            key = bytes.fromhex(args.key)
+            if len(key) != 32:
+                raise ValueError("La clave debe ser de 64 caracteres hexadecimales (32 bytes).")
+        except ValueError as e:
+            logger.error(f"Error de clave: {e}")
+            sys.exit(1)
+
+    config = ConfigManager(CONFIG_FILE)
+    if args.cache_max is not None:
+        config.set_cache_max_entries(args.cache_max if args.cache_max > 0 else None)
+        logger.info(f"Máximo de entradas en caché establecido en: {args.cache_max if args.cache_max else 'sin límite'}")
+    if args.cache_expiry is not None:
+        config.set_cache_expiry_days(args.cache_expiry)
+        logger.info(f"Días de expiración de caché establecidos en: {args.cache_expiry}")
+
+    db = DatabaseManager(CACHE_DB, config)
+    state_manager = StateManager(STATE_FILE)
+
+    if args.clear_cache:
+        db.clear_all()
+
+    if args.clear_cache and not args.list_cache and not args.history and not args.domain and not args.tag:
+        db.close()
+        return
+
+    if args.list_cache:
+        cache_entries = db.list_cache()
+        if cache_entries:
+            logger.info(f"Entradas en caché ({len(cache_entries)}):")
+            for entry in cache_entries:
+                url = decrypt_data(entry['url'], key) if key and CRYPTO_AVAILABLE else entry['url']
+                logger.info(f" - ID: {entry['id']}, Archivo: {entry['filename']}, Tamaño: {entry['size'] // 1024} KB, "
+                            f"MD5: {entry['md5']}, Tag: {entry['tag']}, Categoría: {entry['category']}, "
+                            f"Guardado: {time.ctime(entry['created_at'])}, URL: {url}")
+        else:
+            logger.info("Caché vacía")
+        db.close()
+        return
+
+    if args.history:
+        if not args.tag:
+            logger.error("--history requiere --tag")
+            db.close()
+            sys.exit(2)
+        history = db.get_history_by_tag(args.tag)
+        if history:
+            logger.info(f"Historial de imágenes para tag '{args.tag}':")
+            for item in history:
+                url = decrypt_data(item['url'], key) if key and CRYPTO_AVAILABLE else item['url']
+                logger.info(f" - Archivo: {item['filename']} ({item['size'] // 1024} KB), MD5: {item['md5']}, "
+                            f"Categoría: {item['category']}, Guardado: {time.ctime(item['created_at'])}, URL: {url}")
+        else:
+            logger.info(f"No se encontraron imágenes para tag '{args.tag}'")
+        db.close()
+        return
+
+    # === MODO AUTOMÁTICO (--search) ===
+    if args.search:
+        tag = args.search.replace(' ', '_').lower()
+        base_dir = os.path.abspath(args.output) if args.output else os.path.join(SCRIPT_DIR, "downloads")
+        # Solo agregar subcarpeta si el tag no está ya en la ruta
+        if base_dir.rstrip('/').endswith(tag):
+            output_dir = base_dir
+        else:
+            output_dir = os.path.join(base_dir, tag)
+        
+        try:
+            os.makedirs(output_dir, exist_ok=True, mode=0o755)
+            try:
+                os.chmod(output_dir, 0o755)
+            except Exception:
+                pass
+            logger.info(f"📁 Carpeta creada: {output_dir}")
+        except Exception as e:
+            logger.error(f"Error creando directorio: {e}")
+            sys.exit(1)
+        
+        proxy = None if args.no_proxy else (args.proxy or None)
+        
+        logger.info(f"{'='*60}")
+        logger.info(f"  🔍 MODO AUTOMÁTICO ACTIVADO")
+        logger.info(f"  Target: {args.search}")
+        logger.info(f"  Cantidad: {args.number}")
+        logger.info(f"  Output: {output_dir}")
+        logger.info(f"{'='*60}")
+        
+        target = max(1, int(args.number))
+        candidate_pool = min(max(target * 6, target + 50), 300)
+        scraper = AutoImageScraper(args.search, candidate_pool, args.cloudscraper, proxy)
+        urls = scraper.fetch_image_urls()
+        
+        if not urls:
+            logger.warning("❌ No se encontraron imágenes")
+            db.close()
+            return
+        
+        downloader = ImageDownloader(db, output_dir, tag, args.category, args.cloudscraper, proxy, force_download=args.force, progress=args.progress, key=key)
+        saved = 0
+        skipped = 0
+        total_candidates = len(urls)
+        pbar = tqdm(total=total_candidates, desc="Descargando", disable=not args.progress)
+
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            idx = 0
+            in_flight = set()
+
+            while saved < target:
+                while idx < total_candidates and len(in_flight) < args.workers and (saved + len(in_flight) < target):
+                    url, _ = urls[idx]
+                    idx += 1
+                    in_flight.add(ex.submit(downloader.download_one, url, None, idx, total_candidates, pbar))
+
+                if not in_flight:
+                    break
+
+                done, pending = wait(in_flight, return_when=FIRST_COMPLETED)
+                in_flight = pending
+                for fut in done:
+                    try:
+                        if fut.result():
+                            saved += 1
+                        else:
+                            skipped += 1
+                    except Exception as e:
+                        skipped += 1
+                        logger.debug(f"Error: {e}")
+
+        if pbar:
+            pbar.close()
+        
+        logger.info(f"{'='*60}")
+        logger.info(f"  ✅ COMPLETADO: {saved} imágenes guardadas")
+        if saved < target:
+            logger.warning(f"  ⚠️ No se alcanzó el objetivo ({saved}/{target}). {skipped} URLs se omitieron (caché o fallos).")
+        logger.info(f"  📁 Directorio: {output_dir}")
+        logger.info(f"{'='*60}")
+        db.close()
+        return
+    
+    # === MODO MANUAL (--domain) ===
+    if not args.domain:
+        logger.error("Usa --search 'término' para búsqueda automática o --domain para URL específica")
+        db.close()
+        sys.exit(2)
+    
+    tag = args.tag.replace('#', '').replace(' ', '_').lower() if args.tag else "download"
+    output_dir = os.path.abspath(args.output) if args.output else os.path.join(os.path.dirname(os.path.abspath(__file__)), tag)
+
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        if not os.access(output_dir, os.W_OK):
+            logger.error(f"Sin permisos de escritura: {output_dir}")
+            sys.exit(1)
+    except Exception as e:
+        logger.error(f"Error creando directorio: {e}")
+        sys.exit(1)
+
+    proxy = None
+    if not args.no_proxy:
+        proxy = args.proxy or DEFAULT_TOR_PROXY
+
+    scraper = GenericImageScraper(args.domain, tag, args.number, args.cloudscraper, proxy, state_manager=state_manager)
+    urls = scraper.fetch_image_urls()
+    if not urls:
+        logger.warning("No se recolectaron URLs")
+        db.close()
+        return
+
+    total = len(urls)
+    logger.info(f"Recolectadas {total} URLs candidatas (se intentará guardar hasta {args.number})")
+
+    downloader = ImageDownloader(db, output_dir, args.tag, args.category, args.cloudscraper, proxy, force_download=args.force, progress=args.progress, key=key)
+    saved = 0
+    cached = 0
+    futures = []
+    pbar = tqdm(total=total, desc="Descargando imágenes", disable=not args.progress)
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        for idx, (url, post_id) in enumerate(urls, start=1):
+            futures.append(ex.submit(downloader.download_one, url, post_id, idx, total, pbar))
+        for fut in as_completed(futures):
+            try:
+                result = fut.result()
+                if result:
+                    saved += 1
+                else:
+                    cached += 1
+            except Exception as e:
+                logger.exception(f"Hilo levantó excepción: {e}")
+            if saved >= args.number:
+                logger.info(f"Alcanzado el conteo objetivo: {saved}")
+                break
+    if pbar:
+        pbar.close()
+
+    logger.info(f"Completado. Guardadas {saved} imágenes (objetivo era {args.number}). Directorio: {os.path.abspath(downloader.output_dir)}")
+    if saved < args.number and cached > 0:
+        logger.warning(f"Solo se guardaron {saved} imágenes nuevas; {cached} imágenes ya estaban en caché. "
+                       f"Use --force para redescargar o --clear-cache para resetear la caché.")
+    state_manager.update_state(args.tag, scraper.state_manager.get_state(args.tag).get('last_page', 0), urls[-1][1] if urls else None, [url for url, _ in urls])
+    db.close()
+
+
+def run_gui():
+    if not TK_AVAILABLE:
+        raise RuntimeError("Tkinter no disponible")
+
+    # === ESTILO HACKER - Colores ===
+    BG_COLOR = "#0a0a0a"  # Negro profundo
+    FG_COLOR = "#00ff41"  # Verde neón matrix
+    FG_BRIGHT = "#39ff14"  # Verde brillante
+    FG_CYAN = "#00ffff"   # Cyan
+    FG_RED = "#ff0040"    # Rojo para errores
+    FG_YELLOW = "#ffff00" # Amarillo para warnings
+    ENTRY_BG = "#1a1a1a"  # Gris muy oscuro
+    BTN_BG = "#003300"    # Verde oscuro
+    BTN_ACTIVE = "#004400"
+
+    root = tk.Tk()
+    root.title("[ IMAGE SCRAPER v2.0 ] - Auto Search Engine")
+    root.geometry("950x700")
+    root.configure(bg=BG_COLOR)
+
+    # Banner ASCII art estilo hacker
+    banner_text = """
+    ██╗███╗   ███╗ █████╗  ██████╗ ███████╗    ██████╗  ██████╗ ████████╗
+    ██║████╗ ████║██╔══██╗██╔════╝ ██╔════╝    ██╔══██╗██╔═══██╗╚══██╔══╝
+    ██║██╔████╔██║███████║██║  ███╗█████╗      ██████╔╝██║   ██║   ██║   
+    ██║██║╚██╔╝██║██╔══██║██║   ██║██╔══╝      ██╔══██╗██║   ██║   ██║   
+    ██║██║ ╚═╝ ██║██║  ██║╚██████╔╝███████╗    ██████╔╝╚██████╔╝   ██║   
+    ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝    ╚═════╝  ╚═════╝    ╚═╝   
+                    [ AUTO SEARCH ENGINE v2.0 ]
+    """
+    banner = tk.Label(root, text=banner_text, font=("Courier", 9, "bold"), 
+                      fg=FG_COLOR, bg=BG_COLOR, justify="left")
+    banner.pack(anchor="w", padx=10, pady=(10, 5))
+
+    # Frame principal
+    frm = tk.Frame(root, bg=BG_COLOR)
+    frm.pack(fill="x", padx=20, pady=10)
+    frm.columnconfigure(1, weight=1)
+
+    # Variables
+    search_var = tk.StringVar(value="")
+    num_var = tk.StringVar(value="20")
+    out_var = tk.StringVar(value=str(os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads")))
+
+    # Etiqueta principal
+    tk.Label(frm, text="┌─[ BÚSQUEDA AUTOMÁTICA ]", font=("Courier", 10, "bold"),
+             fg=FG_BRIGHT, bg=BG_COLOR).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
+
+    # Campo de búsqueda principal (SIMPLIFICADO - solo esto necesita el usuario)
+    tk.Label(frm, text="► IMAGEN:", font=("Courier", 11, "bold"),
+             fg=FG_COLOR, bg=BG_COLOR, width=12, anchor="w").grid(row=1, column=0, sticky="w", pady=5)
+    search_entry = tk.Entry(frm, textvariable=search_var, font=("Courier", 12), 
+                            fg=FG_BRIGHT, bg=ENTRY_BG, insertbackground=FG_COLOR,
+                            relief="flat", highlightthickness=1, highlightcolor=FG_COLOR)
+    search_entry.grid(row=1, column=1, columnspan=2, sticky="ew", pady=5, ipady=8)
+    search_entry.insert(0, "")
+    search_entry.focus()
+
+    # Info
+    tk.Label(frm, text="   ¿Qué imagen quieres? (ej: gatos, paisajes, anime, coches)", 
+             font=("Courier", 9), fg="#666666", bg=BG_COLOR).grid(row=2, column=0, columnspan=3, sticky="w")
+
+    # Cantidad
+    tk.Label(frm, text="► CANTIDAD:", font=("Courier", 10),
+             fg=FG_COLOR, bg=BG_COLOR, width=12, anchor="w").grid(row=3, column=0, sticky="w", pady=5)
+    num_entry = tk.Entry(frm, textvariable=num_var, font=("Courier", 11), width=10,
+                         fg=FG_BRIGHT, bg=ENTRY_BG, insertbackground=FG_COLOR,
+                         relief="flat", highlightthickness=1, highlightcolor=FG_COLOR)
+    num_entry.grid(row=3, column=1, sticky="w", pady=5, ipady=5)
+
+    # Output
+    tk.Label(frm, text="► OUTPUT:", font=("Courier", 10),
+             fg=FG_COLOR, bg=BG_COLOR, width=12, anchor="w").grid(row=4, column=0, sticky="w", pady=5)
+    out_entry = tk.Entry(frm, textvariable=out_var, font=("Courier", 10),
+                         fg=FG_CYAN, bg=ENTRY_BG, insertbackground=FG_COLOR,
+                         relief="flat", highlightthickness=1, highlightcolor=FG_COLOR)
+    out_entry.grid(row=4, column=1, sticky="ew", pady=5, ipady=5)
+
+    def pick_dir():
+        d = filedialog.askdirectory()
+        if d:
+            out_var.set(d)
+
+    tk.Button(frm, text="[...]", command=pick_dir, font=("Courier", 9, "bold"),
+              fg=FG_COLOR, bg=BTN_BG, activebackground=BTN_ACTIVE, activeforeground=FG_BRIGHT,
+              relief="flat", width=5).grid(row=4, column=2, padx=(10, 0))
+
+    # Botones
+    btns = tk.Frame(root, bg=BG_COLOR)
+    btns.pack(fill="x", padx=20, pady=15)
+
+    # Terminal/Log con estilo hacker
+    term_frame = tk.Frame(root, bg=FG_COLOR, padx=2, pady=2)
+    term_frame.pack(fill="both", expand=True, padx=20, pady=(0, 15))
+    
+    tk.Label(term_frame, text=" ▼ TERMINAL OUTPUT ", font=("Courier", 9, "bold"),
+             fg=BG_COLOR, bg=FG_COLOR).pack(anchor="w")
+
+    logbox = ScrolledText(term_frame, height=18, font=("Courier", 10),
+                          fg=FG_COLOR, bg=BG_COLOR, insertbackground=FG_COLOR,
+                          relief="flat", wrap="word")
+    logbox.pack(fill="both", expand=True)
+    logbox.configure(state="disabled")
+
+    # Configurar tags de colores para el log
+    logbox.tag_config("success", foreground=FG_BRIGHT)
+    logbox.tag_config("error", foreground=FG_RED)
+    logbox.tag_config("warning", foreground=FG_YELLOW)
+    logbox.tag_config("info", foreground=FG_CYAN)
+    logbox.tag_config("normal", foreground=FG_COLOR)
+
+    q = queue.Queue()
+    proc = {"p": None}
+    stats = {"downloaded": 0, "errors": 0}
+
+    def log(s: str, tag="normal"):
+        logbox.configure(state="normal")
+        # Detectar tipo de mensaje para colorear
+        if "✅" in s or "Guardada" in s or "SUCCESS" in s:
+            tag = "success"
+        elif "❌" in s or "Error" in s or "error" in s.lower():
+            tag = "error"
+        elif "⚠️" in s or "WARNING" in s:
+            tag = "warning"
+        elif "🔍" in s or "🚀" in s or "→" in s:
+            tag = "info"
+        logbox.insert("end", s, tag)
+        logbox.see("end")
+        logbox.configure(state="disabled")
+
+    def pump():
+        try:
+            while True:
+                line = q.get_nowait()
+                log(line)
+        except queue.Empty:
+            pass
+        root.after(80, pump)
+
+    def reader_thread(p):
+        try:
+            for line in p.stdout:
+                q.put(line)
+        except Exception as e:
+            q.put(f"[ERROR] reader: {e}\n")
+
+    def start():
+        if proc["p"] is not None:
+            return
+
+        search_term = search_var.get().strip()
+        if not search_term:
+            log("\n[!] ERROR: Debes escribir qué imagen buscar\n", "error")
+            return
+
+        try:
+            n = int(num_var.get().strip())
+        except ValueError:
+            log("\n[!] ERROR: La cantidad debe ser un número\n", "error")
+            return
+
+        out_dir = out_var.get().strip()
+        if not out_dir:
+            out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads")
+        
+        # Crear carpeta con nombre de búsqueda automáticamente
+        folder_name = search_term.replace(' ', '_').lower()
+        final_dir = os.path.join(out_dir, folder_name)
+        
+        # Limpiar log
+        logbox.configure(state="normal")
+        logbox.delete("1.0", "end")
+        logbox.configure(state="disabled")
+
+        log(f"\n{'='*60}\n", "info")
+        log(f"  [*] INICIANDO BÚSQUEDA AUTOMÁTICA\n", "info")
+        log(f"  [*] Imagen: {search_term}\n", "info")
+        log(f"  [*] Cantidad: {n} imágenes\n", "info")
+        log(f"  [*] Carpeta: {final_dir}\n", "info")
+        log(f"{'='*60}\n\n", "info")
+
+        cmd = [
+            sys.executable,
+            os.path.abspath(__file__),
+            "--cli",
+            "--search",
+            search_term,
+            "--number",
+            str(n),
+            "--output",
+            final_dir,
+            "--no-proxy",
+            "--verbose"
+        ]
+
+        log(f"$ {' '.join(cmd)}\n\n", "normal")
+
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        proc["p"] = p
+        t = threading.Thread(target=reader_thread, args=(p,), daemon=True)
+        t.start()
+
+        def wait_done():
+            rc = p.wait()
+            if rc == 0:
+                q.put(f"\n{'='*60}\n")
+                q.put(f"  [✓] DESCARGA COMPLETADA EXITOSAMENTE\n")
+                q.put(f"{'='*60}\n")
+            else:
+                q.put(f"\n[!] Proceso terminado con código: {rc}\n")
+            proc["p"] = None
+
+        threading.Thread(target=wait_done, daemon=True).start()
+
+    def stop():
+        p = proc.get("p")
+        if p is None:
+            return
+        try:
+            p.terminate()
+            log("\n[!] PROCESO DETENIDO POR EL USUARIO\n", "warning")
+        except Exception:
+            pass
+
+    def clear_log():
+        logbox.configure(state="normal")
+        logbox.delete("1.0", "end")
+        logbox.configure(state="disabled")
+
+    # Botones estilo hacker
+    tk.Button(btns, text="[ ▶ INICIAR ]", command=start, font=("Courier", 11, "bold"),
+              fg="#00ff41", bg="#003300", activebackground="#004400", activeforeground="#39ff14",
+              relief="flat", width=15, height=2).pack(side="left", padx=5)
+    tk.Button(btns, text="[ ■ DETENER ]", command=stop, font=("Courier", 11, "bold"),
+              fg="#ff0040", bg="#330000", activebackground="#440000", activeforeground="#ff4444",
+              relief="flat", width=15, height=2).pack(side="left", padx=5)
+    tk.Button(btns, text="[ ✕ LIMPIAR ]", command=clear_log, font=("Courier", 11, "bold"),
+              fg="#ffff00", bg="#333300", activebackground="#444400", activeforeground="#ffff44",
+              relief="flat", width=15, height=2).pack(side="left", padx=5)
+    
+    # Mensaje inicial en terminal
+    log("┌─────────────────────────────────────────────────────────────┐\n", "info")
+    log("│  IMAGE BOT v2.0 - Sistema de búsqueda automática           │\n", "info")
+    log("│  Escribe el nombre de la imagen y presiona INICIAR         │\n", "info")
+    log("│  Busca automáticamente en: Bing, DuckDuckGo, Pixabay...    │\n", "info")
+    log("└─────────────────────────────────────────────────────────────┘\n", "info")
+
+    root.after(100, pump)
+    root.mainloop()
+
+
+def main_entry():
+    if "--cli" in sys.argv:
+        args = parse_args()
+        run_cli(args)
+        return
+    if not TK_AVAILABLE:
+        args = parse_args()
+        args.cli = True
+        run_cli(args)
+        return
+    run_gui()
+
+if __name__ == "__main__":
+    main_entry()

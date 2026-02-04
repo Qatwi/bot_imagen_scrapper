@@ -1,125 +1,193 @@
-# 🖼️ Image Scraper & Downloader (Python)
-
-A **high-performance, thread-safe image scraper and downloader** designed for collecting large volumes of images from **booru-style websites** via a clean and flexible **CLI interface**.
-
-The project is optimized for **scalability**, **low memory usage**, and **fault tolerance**, allowing interrupted runs to be resumed without reprocessing already downloaded content.
 
 ---
 
-## 🚀 Features
+# Image Bot v_01 🖼️
 
-### 🔹 Caching & Persistence
+GUI-Based Automatic Image Scraper & Downloader (Python)
 
-* **SQLite-based cache** with:
+**Image Bot** is a **desktop application with a graphical user interface (GUI)** that automatically searches, filters, and downloads batches of images based on a simple user query.
 
-  * Configurable maximum entries (or unlimited mode)
-  * Automatic expiration by age (days)
-  * CLI tools for cache inspection and maintenance:
-
-    * list entries
-    * clear cache
-    * view download history
-* Persistent metadata storage for long-term tracking and analysis.
+The application is designed to be **easy to use** (no command-line interaction required for normal users) while internally providing a **robust and scalable scraping engine** with caching, deduplication, concurrency, and optional advanced features.
 
 ---
 
-### 🔹 Performance & Concurrency
+## Overview
 
-* ⚡ **Parallel downloads** powered by `ThreadPoolExecutor`
+Image Bot focuses on **automation, reliability, and usability**.
+All functionality is controlled through the graphical interface, making it suitable for non-technical users while still implementing professional-grade internal logic.
 
-  * Efficient for hundreds or thousands of images per run
-  * Designed to minimize RAM usage during high-volume operations
-* Thread-safe architecture to prevent race conditions and data corruption.
-
----
-
-### 🔹 Reliability & Resume Support
-
-* ♻️ **Resume mode** via a state file:
-
-  * Safely continues interrupted sessions
-  * Avoids re-fetching or re-downloading previously processed files
-* Robust error handling with retries and structured logging.
+The GUI handles search, download execution, progress reporting, and logging in real time.
 
 ---
 
-### 🔹 Duplicate Detection & Integrity
+## Graphical User Interface
 
-* Multi-layer duplicate prevention using:
+The application launches a **Tkinter-based desktop interface** that includes:
 
-  * URL matching
-  * **MD5 hash** comparison
-  * HTTP signals such as **ETag** and **Content-Length**
-* Ensures storage efficiency and avoids redundant downloads.
+* A single search input (what image you want)
+* A numeric field for the number of images
+* An output directory selector
+* A live terminal-style log window
+* Start / Stop / Clear controls
 
----
-
-### 🔹 Metadata & Logging
-
-* Full download tracking, including:
-
-  * Source URL
-  * Filename
-  * File size
-  * MD5 checksum
-  * Timestamps
-  * Tags and categories
-* 📊 Structured logging with adjustable verbosity
-* Optional progress visualization using `tqdm`.
+No manual commands are required to operate the application.
 
 ---
 
-### 🔹 Security (Optional)
+## Automatic Image Search
 
-* 🔐 **AES-GCM encryption** support for sensitive stored data
+When a search term is entered (for example: `cats`, `landscapes`, `anime`), the bot automatically:
 
-  * Enabled via user-provided encryption key
-  * Designed for environments where metadata confidentiality matters
-
----
-
-### 🔹 Extensibility
-
-* 🧩 Easy to extend to new sites:
-
-  * Add support by defining site-specific configs and selectors
-* Clean separation between core logic and site adapters.
+1. Detects the search category using keyword analysis
+2. Selects the most appropriate image source
+3. Falls back to Wikimedia Commons for general queries
+4. Filters out low-quality, irrelevant, or duplicate images
+5. Downloads images concurrently
+6. Prevents re-downloads using a persistent cache
 
 ---
 
-## 📦 Use Cases
+## Key Features ⚙️
 
-* Dataset collection for research or ML experiments
-* Personal archiving and automation
-* Performance testing of concurrent download systems
-* Learning resource for thread-safe scraping architectures
+### Performance
+
+* Multi-threaded downloads using `ThreadPoolExecutor`
+* Streaming downloads to minimize memory usage
+
+### Deduplication
+
+* URL-based cache
+* ETag / Content-Length checks (when available)
+* MD5 hash verification after download
+
+### Persistent Cache
+
+* SQLite database storing:
+
+  * image URL (optionally encrypted)
+  * filename
+  * file size
+  * MD5 hash
+  * timestamps
+  * tag and category
+
+### Resume-Ready Architecture
+
+* Internal state tracking to avoid reprocessing
+* Designed to handle interruptions safely
+
+### Optional Encryption
+
+* AES-GCM encryption for sensitive stored values
+* Enabled only when a user-provided key is supplied
+
+### Extensible Design
+
+* New image sources can be added via configuration dictionaries
+* Clear separation between GUI logic and scraping logic
 
 ---
 
-## ⚠️ Responsible Use Disclaimer
+## Installation
 
-### Responsible Use
+### Requirements
 
-This repository is intended for **educational**, **testing**, and **personal automation** purposes **only**, and must be used in **authorized contexts**.
+* Python 3.10 or newer recommended
 
-Users are responsible for ensuring compliance with:
+Core dependencies:
 
-* Website **Terms of Service**
+* `requests`
+* `beautifulsoup4`
+
+Optional dependencies:
+
+* `tqdm` (progress indicators)
+* `cloudscraper` (Cloudflare-protected sites)
+* `cryptography` (AES-GCM encryption)
+* `tkinter` (GUI, often bundled with Python)
+
+### Setup
+
+```bash
+git clone https://github.com/Qatwi/bot_imagen_scrapper.git
+cd bot_imagen_scrapper
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+Example `requirements.txt`:
+
+```txt
+requests
+beautifulsoup4
+tqdm
+cloudscraper
+cryptography
+```
+
+---
+
+## Running the Application
+
+### GUI Mode (default)
+
+```bash
+python3 bot_imagen.py
+```
+
+If Tkinter is available, the graphical interface will launch automatically.
+If not, the application will gracefully fall back to console mode.
+
+---
+
+## Output Structure
+
+Downloaded images are organized automatically as:
+
+```
+<output_directory>/<search_term>/
+```
+
+Example:
+
+```
+downloads/cute_cats/
+```
+
+---
+
+## Local Data Files
+
+The application creates and maintains the following local files:
+
+* `scraper_cache.db` — SQLite cache and download history
+* `scraper_config.json` — persistent configuration
+* `scraper_state.json` — internal resume/state data
+
+These files allow the application to avoid duplicates and maintain consistency across runs.
+
+---
+
+## Responsible Use
+
+This software is intended for **educational**, **testing**, and **personal automation** use in **authorized contexts only**.
+
+Users are responsible for complying with:
+
+* Website Terms of Service
 * `robots.txt` directives
-* Copyright and licensing restrictions
+* Copyright and licensing rules
 
-Do **not** use this tool to collect, store, or redistribute content without proper permission.
-The author assumes no responsibility for misuse or violations resulting from the use of this software.
+The author assumes no responsibility for misuse.
 
 ---
 
-Si quieres, en el siguiente paso puedo ayudarte a:
+## Project Status
 
-* 🔹 añadir una sección **Installation / Usage**
-* 🔹 escribir **CLI examples** bien pro
-* 🔹 o dejar un **README orientado a portfolio** (pensado para recruiters)
+This project is actively evolving and serves as:
 
-Dime hacia dónde lo quieres llevar 👌
-
+* a practical personal automation tool, and
+* a portfolio project demonstrating GUI integration, scraping architecture, caching, and concurrency.
 
 
